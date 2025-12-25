@@ -18,6 +18,7 @@
 # %autoreload 2
 
 # %%
+#加入动态声纹层
 import math
 import random
 from argparse import Namespace
@@ -283,3 +284,32 @@ def _noise(x, add_noise_level=0.0, mult_noise_level=0.0):
             mult_noise_level * np.random.beta(2, 5) * (2 * torch.FloatTensor(x.shape).uniform_() - 1).to(x.device) + 1
         )
     return mult_noise * x + add_noise
+
+class DynamicTrajectoryBranch(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, num_layers=2):
+        super().__init__()
+        
+        # 1. 降维投影：先压缩特征，减少计算量，聚焦核心信息
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
+        
+        # 2. 动态演化建模：使用 Bi-GRU 捕捉长时依赖
+        # batch_first=True -> (Batch, Seq, Feature)
+        self.temporal_encoder = nn.GRU(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            bidirectional=True,
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        # 3. 轨迹注意力机制 (Trajectory Attention)
+        # 并不是所有时间点都重要，让模型自动寻找"演化最剧烈"的片段
+        self.attention_fc = nn.Linear(hidden_dim * 2, 1)
+        
+        # 4. 最终映射
+        self.output_proj = nn.Linear(hidden_dim * 2, hidden_dim)
