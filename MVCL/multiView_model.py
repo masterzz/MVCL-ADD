@@ -12,6 +12,7 @@
 #     language: python
 #     name: python3
 # ---
+# author: zhubr17
 
 # %%
 # %load_ext autoreload
@@ -299,8 +300,8 @@ class DynamicTrajectoryBranch(nn.Module):
         # 2. 动态演化建模：使用 Bi-GRU 捕捉长时依赖
         # batch_first=True -> (Batch, Seq, Feature)
         self.temporal_encoder = nn.GRU(
-            input_dim=hidden_dim,
-            hidden_dim=hidden_dim,
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
             num_layers=num_layers,
             bidirectional=True,
             batch_first=True,
@@ -313,3 +314,41 @@ class DynamicTrajectoryBranch(nn.Module):
         
         # 4. 最终映射
         self.output_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+
+    def forward(self, x):
+        """
+        Input: x (B, T, D) - 来自 WavLM 的序列特征
+        Output: 
+            - trajectory_feat: (B, Hidden) - 聚合后的全局轨迹特征
+            - raw_trajectory: (B, T, Hidden*2) - 每一帧的动态状态
+        """
+        B, T, D = x.shape
+        
+        # --- A. 特征预处理 ---
+        x_proj = self.input_proj(x)  # (B, T, hidden_dim)
+        
+        # --- B. 计算一阶差分 (模拟速度/演化趋势) ---
+        # Deepfake 往往在帧间过渡时出现瑕疵
+        # pad 第一个时间步以保持长度一致
+        x_diff = x_proj - F.pad(x_proj[:, :-1, :], (0, 0, 1, 0))
+        
+        # 将原始特征和差分特征融合 (这里简单相加，也可以拼接)
+        x_dynamic = x_proj + x_diff
+        
+        # --- C. 时序建模 (Bi-GRU) ---
+        # output: (B, T, hidden_dim * 2)
+        # hn: (num_layers*2, B, hidden_dim)
+        lstm_out, _ = self.temporal_encoder(x_dynamic)
+        
+        # --- D. 动态注意力聚合 ---
+        # 计算每个时间步的权重 score
+        attn_scores = self.attention_fc(lstm_out)   # (B, T, 1)
+        attn_weights = F.softmax(attn_scores, dim=1) # (B, T, 1)
+        
+        # 加权求和：得到能够代表整段语音"演化轨迹"的单个向量
+        trajectory_feat = torch.sum(lstm_out * attn_weights, dim=1) # (B, hidden_dim * 2)
+        
+        # 最后的映射
+        final_feat = self.output_proj(trajectory_feat) # (B, hidden_dim)
+        
+        return final_feat, lstm_out
