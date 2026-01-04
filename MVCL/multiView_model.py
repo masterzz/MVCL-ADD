@@ -297,10 +297,17 @@ class DynamicTrajectoryBranch(nn.Module):
             nn.GELU()
         )
         
-        # 2. 动态演化建模：使用 Bi-GRU 捕捉长时依赖
-        # batch_first=True -> (Batch, Seq, Feature)
+        # --- 调整输入维度以适应拼接 ---
+        # 原始特征(1) + 一阶差分(1) + 二阶差分(1) = 3倍通道
+        # 拼接后维度变大，再通过一个 Linear 融合回 hidden_dim，给 GRU 减负
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU()
+        )
+
+        # 2. 动态演化建模 (Bi-GRU)
         self.temporal_encoder = nn.GRU(
-            input_size=hidden_dim,
+            input_size=hidden_dim,  # 融合后的维度
             hidden_size=hidden_dim,
             num_layers=num_layers,
             bidirectional=True,
@@ -308,12 +315,33 @@ class DynamicTrajectoryBranch(nn.Module):
             dropout=0.1
         )
         
-        # 3. 轨迹注意力机制 (Trajectory Attention)
-        # 并不是所有时间点都重要，让模型自动寻找"演化最剧烈"的片段
-        self.attention_fc = nn.Linear(hidden_dim * 2, 1)
+        # 3. 增强版轨迹注意力 (Attention)
+        # --- 引入 Tanh 非线性 ---
+        self.attention_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), # 先压缩一下
+            nn.Tanh(),                             # 非线性激活
+            nn.Linear(hidden_dim, 1)               # 输出分数
+        )
         
         # 4. 最终映射
         self.output_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+    
+    def compute_deltas(self, x):
+        """计算一阶和二阶差分"""
+        # x: (B, T, D)
+        # Pad 1 frame at the beginning to verify delta
+        x_pad = F.pad(x, (0, 0, 1, 0)) # Pad time dim
+        
+        # 一阶差分 (Velocity)
+        delta = x_pad[:, 1:, :] - x_pad[:, :-1, :]
+        
+        # Pad again for double delta
+        delta_pad = F.pad(delta, (0, 0, 1, 0))
+        
+        # 二阶差分 (Acceleration) - 捕捉抖动(Jitter)
+        delta_delta = delta_pad[:, 1:, :] - delta_pad[:, :-1, :]
+        
+        return delta, delta_delta
 
     def forward(self, x):
         """
@@ -324,31 +352,31 @@ class DynamicTrajectoryBranch(nn.Module):
         """
         B, T, D = x.shape
         
-        # --- A. 特征预处理 ---
-        x_proj = self.input_proj(x)  # (B, T, hidden_dim)
+        # 1. 基础特征
+        x_base = self.input_proj(x)  # (B, T, hidden)
         
-        # --- B. 计算一阶差分 (模拟速度/演化趋势) ---
-        # Deepfake 往往在帧间过渡时出现瑕疵
-        # pad 第一个时间步以保持长度一致
-        x_diff = x_proj - F.pad(x_proj[:, :-1, :], (0, 0, 1, 0))
+        # 2. 计算动态特征 (速度 & 加速度)
+        x_vel, x_acc = self.compute_deltas(x_base)
         
-        # 将原始特征和差分特征融合 (这里简单相加，也可以拼接)
-        x_dynamic = x_proj + x_diff
+        # 3. 特征融合 (Concatenation)
+        # 将静态、速度、加速度拼接，保留所有物理信息
+        x_combined = torch.cat([x_base, x_vel, x_acc], dim=-1) # (B, T, hidden*3)
+        x_fused = self.fusion_proj(x_combined)                 # (B, T, hidden)
         
-        # --- C. 时序建模 (Bi-GRU) ---
-        # output: (B, T, hidden_dim * 2)
-        # hn: (num_layers*2, B, hidden_dim)
-        lstm_out, _ = self.temporal_encoder(x_dynamic)
+        # 4. 时序建模
+        # lstm_out: (B, T, hidden*2)
+        lstm_out, _ = self.temporal_encoder(x_fused)
         
-        # --- D. 动态注意力聚合 ---
-        # 计算每个时间步的权重 score
-        attn_scores = self.attention_fc(lstm_out)   # (B, T, 1)
-        attn_weights = F.softmax(attn_scores, dim=1) # (B, T, 1)
+        # 5. 动态注意力聚合
+        # score: (B, T, 1)
+        attn_scores = self.attention_net(lstm_out)
+        attn_weights = F.softmax(attn_scores, dim=1)
         
-        # 加权求和：得到能够代表整段语音"演化轨迹"的单个向量
-        trajectory_feat = torch.sum(lstm_out * attn_weights, dim=1) # (B, hidden_dim * 2)
+        # 加权求和
+        # trajectory_feat: (B, hidden*2)
+        trajectory_feat = torch.sum(lstm_out * attn_weights, dim=1)
         
-        # 最后的映射
-        final_feat = self.output_proj(trajectory_feat) # (B, hidden_dim)
+        # 6. 输出
+        final_feat = self.output_proj(trajectory_feat)
         
         return final_feat, lstm_out

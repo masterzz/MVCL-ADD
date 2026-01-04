@@ -25,7 +25,7 @@ DATA_ROOT = r"D:\learn\MVCL-ADD\download\archive\LA"
 LIST_SAVE_DIR = "data_lists"
 
 # 训练超参数
-BATCH_SIZE = 16         # 显存允许可调大
+BATCH_SIZE = 32         # 显存允许可调大
 MAX_EPOCHS = 5          # 训练轮数
 NUM_WORKERS = 0         # Windows 必须为 0
 
